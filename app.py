@@ -1,90 +1,178 @@
-
-#!/usr/bin/env python
-# coding: utf-8
-
-import numpy as np
-import cv2
-import streamlit as st
-from PIL import Image
 import os
+import io
+import uuid
+import sys
+import yaml
+import traceback
 
-# Load Model Paths (Make sure these paths are correct!)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-prototxt = os.path.join(BASE_DIR, "models/models_colorization_deploy_v2.prototxt")
-model = os.path.join(BASE_DIR, "models/colorization_release_v2.caffemodel")
-points = os.path.join(BASE_DIR, "models/pts_in_hull.npy")
+with open('./config.yaml', 'r') as fd:
+    opts = yaml.safe_load(fd)
 
-# Check if files exist
-if not all(map(os.path.exists, [prototxt, model, points])):
-    st.error("Model files are missing! Check the 'models' folder.")
-    st.stop()
+sys.path.insert(0, './white_box_cartoonizer/')
 
-# Load the colorization model
-net = cv2.dnn.readNetFromCaffe(prototxt, model)
-pts = np.load(points)
+import cv2
+from flask import Flask, render_template, make_response, flash
+import flask
+from PIL import Image
+import numpy as np
+import skvideo.io
+if opts['colab-mode']:
+    from flask_ngrok import run_with_ngrok #to run the application on colab using ngrok
 
-# Add the cluster centers as 1x1 convolutions to the model
-class8 = net.getLayerId("class8_ab")
-conv8 = net.getLayerId("conv8_313_rh")
-pts = pts.transpose().reshape(2, 313, 1, 1)
-net.getLayer(class8).blobs = [pts.astype("float32")]
-net.getLayer(conv8).blobs = [np.full([1, 313], 2.606, dtype="float32")]
 
-def colorizer(img):
-    """ Function to colorize black & white images """
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+from cartoonize import WB_Cartoonize
+
+if not opts['run_local']:
+    if 'GOOGLE_APPLICATION_CREDENTIALS' in os.environ:
+        from gcloud_utils import upload_blob, generate_signed_url, delete_blob, download_video
+    else:
+        raise Exception("GOOGLE_APPLICATION_CREDENTIALS not set in environment variables")
+    from video_api import api_request
+    # Algorithmia (GPU inference)
+    import Algorithmia
+
+app = Flask(__name__)
+if opts['colab-mode']:
+    run_with_ngrok(app)   #starts ngrok when the app is run
+
+app.config['UPLOAD_FOLDER_VIDEOS'] = 'static/uploaded_videos'
+app.config['CARTOONIZED_FOLDER'] = 'static/cartoonized_images'
+
+app.config['OPTS'] = opts
+
+## Init Cartoonizer and load its weights 
+wb_cartoonizer = WB_Cartoonize(os.path.abspath("white_box_cartoonizer/saved_models/"), opts['gpu'])
+
+def convert_bytes_to_image(img_bytes):
+    """Convert bytes to numpy array
+
+    Args:
+        img_bytes (bytes): Image bytes read from flask.
+
+    Returns:
+        [numpy array]: Image numpy array
+    """
     
-    # Convert image to LAB color space
-    scaled = img.astype("float32") / 255.0
-    lab = cv2.cvtColor(scaled, cv2.COLOR_RGB2LAB)
-
-    # Resize to 224x224 for the model
-    resized = cv2.resize(lab, (224, 224))
-    L = cv2.split(resized)[0]
-    L -= 50  # Mean centering
-
-    # Predict 'ab' channels
-    net.setInput(cv2.dnn.blobFromImage(L))
-    ab = net.forward()[0, :, :, :].transpose((1, 2, 0))
-    ab = cv2.resize(ab, (img.shape[1], img.shape[0]))
-
-    # Merge L with predicted 'ab' channels
-    L = cv2.split(lab)[0]
-    colorized = np.concatenate((L[:, :, np.newaxis], ab), axis=2)
+    pil_image = Image.open(io.BytesIO(img_bytes))
+    if pil_image.mode=="RGBA":
+        image = Image.new("RGB", pil_image.size, (255,255,255))
+        image.paste(pil_image, mask=pil_image.split()[3])
+    else:
+        image = pil_image.convert('RGB')
     
-    # Convert LAB to RGB
-    colorized = cv2.cvtColor(colorized, cv2.COLOR_LAB2RGB)
-    colorized = np.clip(colorized, 0, 1)
-    colorized = (255 * colorized).astype("uint8")
-
-    return colorized
-
-##########################################################################################################
-
-st.write("# Colorizing Black & White Images")
-st.write("Upload a black & white image to colorize it!")
-
-file = st.sidebar.file_uploader("Upload an image (JPG/PNG)", type=["jpg", "png"])
-
-if file:
-    image = Image.open(file)
-    img = np.array(image)
-
-    if img.shape[-1] == 4:  # Convert RGBA to RGB if needed
-        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-
-    col1, col2 = st.columns(2)
+    image = np.array(image)
     
-    with col1:
-        st.text("Original Image")
-        st.image(image, use_column_width=True)
-    
-    with col2:
-        st.text("Colorized Image")
-        colorized = colorizer(img)
-        st.image(colorized, use_column_width=True)
+    return image
 
-    st.success("✅ Done!")
-else:
-    st.warning("⚠️ Please upload an image to continue.")
+@app.route('/')
+@app.route('/cartoonize', methods=["POST", "GET"])
+def cartoonize():
+    opts = app.config['OPTS']
+    if flask.request.method == 'POST':
+        try:
+            if flask.request.files.get('image'):
+                img = flask.request.files["image"].read()
+                
+                ## Read Image and convert to PIL (RGB) if RGBA convert appropriately
+                image = convert_bytes_to_image(img)
+
+                img_name = str(uuid.uuid4())
+                
+                cartoon_image = wb_cartoonizer.infer(image)
+                
+                cartoonized_img_name = os.path.join(app.config['CARTOONIZED_FOLDER'], img_name + ".jpg")
+                cv2.imwrite(cartoonized_img_name, cv2.cvtColor(cartoon_image, cv2.COLOR_RGB2BGR))
+                
+                if not opts["run_local"]:
+                    # Upload to bucket
+                    output_uri = upload_blob("cartoonized_images", cartoonized_img_name, img_name + ".jpg", content_type='image/jpg')
+
+                    # Delete locally stored cartoonized image
+                    os.system("rm " + cartoonized_img_name)
+                    cartoonized_img_name = generate_signed_url(output_uri)
+                    
+
+                return render_template("index_cartoonized.html", cartoonized_image=cartoonized_img_name)
+
+            if flask.request.files.get('video'):
+                
+                filename = str(uuid.uuid4()) + ".mp4"
+                video = flask.request.files["video"]
+                original_video_path = os.path.join(app.config['UPLOAD_FOLDER_VIDEOS'], filename)
+                video.save(original_video_path)
+                
+                modified_video_path = os.path.join(app.config['UPLOAD_FOLDER_VIDEOS'], filename.split(".")[0] + "_modified.mp4")
+                
+                ## Fetch Metadata and set frame rate
+                file_metadata = skvideo.io.ffprobe(original_video_path)
+                original_frame_rate = None
+                if 'video' in file_metadata:
+                    if '@r_frame_rate' in file_metadata['video']:
+                        original_frame_rate = file_metadata['video']['@r_frame_rate']
+
+                if opts['original_frame_rate']:
+                    output_frame_rate = original_frame_rate
+                else:
+                    output_frame_rate = opts['output_frame_rate']    
+
+                output_frame_rate_number = int(output_frame_rate.split('/')[0])
+
+                #change the size if you want higher resolution :
+                ############################
+                # Recommnded width_resize  #
+                ############################
+                #width_resize = 1920 for 1080p: 1920x1080.
+                #width_resize = 1280 for 720p: 1280x720.
+                #width_resize = 854 for 480p: 854x480.
+                #width_resize = 640 for 360p: 640x360.
+                #width_resize = 426 for 240p: 426x240.
+                width_resize=opts['resize-dim']
+
+                # Slice, Resize and Convert Video as per settings
+                if opts['trim-video']:
+                    #change the variable value to change the time_limit of video (In Seconds)
+                    time_limit = opts['trim-video-length']
+                    if opts['original_resolution']:
+                        os.system("ffmpeg -hide_banner -loglevel warning -ss 0 -i '{}' -t {} -filter:v scale=-1:-2 -r {} -c:a copy '{}'".format(os.path.abspath(original_video_path), time_limit, output_frame_rate_number, os.path.abspath(modified_video_path)))
+                    else:
+                        os.system("ffmpeg -hide_banner -loglevel warning -ss 0 -i '{}' -t {} -filter:v scale={}:-2 -r {} -c:a copy '{}'".format(os.path.abspath(original_video_path), time_limit, width_resize, output_frame_rate_number, os.path.abspath(modified_video_path)))
+                else:
+                    if opts['original_resolution']:
+                       os.system("ffmpeg -hide_banner -loglevel warning -ss 0 -i '{}' -filter:v scale=-1:-2 -r {} -c:a copy '{}'".format(os.path.abspath(original_video_path), output_frame_rate_number, os.path.abspath(modified_video_path)))
+                    else:
+                        os.system("ffmpeg -hide_banner -loglevel warning -ss 0 -i '{}' -filter:v scale={}:-2 -r {} -c:a copy '{}'".format(os.path.abspath(original_video_path), width_resize, output_frame_rate_number, os.path.abspath(modified_video_path)))
+                
+                audio_file_path = os.path.join(app.config['UPLOAD_FOLDER_VIDEOS'], filename.split(".")[0] + "_audio_modified.mp4")
+                os.system("ffmpeg -hide_banner -loglevel warning -i '{}' -map 0:1 -vn -acodec copy -strict -2  '{}'".format(os.path.abspath(modified_video_path), os.path.abspath(audio_file_path)))
+
+                if opts["run_local"]:
+                    cartoon_video_path = wb_cartoonizer.process_video(modified_video_path, output_frame_rate)
+                else:
+                    data_uri = upload_blob("processed_videos_cartoonize", modified_video_path, filename, content_type='video/mp4', algo_unique_key='cartoonizeinput')
+                    response = api_request(data_uri)
+                    # Delete the processed video from Cloud storage
+                    delete_blob("processed_videos_cartoonize", filename)
+                    cartoon_video_path = download_video('cartoonized_videos', os.path.basename(response['output_uri']), os.path.join(app.config['UPLOAD_FOLDER_VIDEOS'], filename.split(".")[0] + "_cartoon.mp4"))
+                
+                ## Add audio to the cartoonized video
+                final_cartoon_video_path = os.path.join(app.config['UPLOAD_FOLDER_VIDEOS'], filename.split(".")[0] + "_cartoon_audio.mp4")
+                os.system("ffmpeg -hide_banner -loglevel warning -i '{}' -i '{}' -codec copy -shortest '{}'".format(os.path.abspath(cartoon_video_path), os.path.abspath(audio_file_path), os.path.abspath(final_cartoon_video_path)))
+
+                # Delete the videos from local disk
+                os.system("rm {} {} {} {}".format(original_video_path, modified_video_path, audio_file_path, cartoon_video_path))
+
+                return render_template("index_cartoonized.html", cartoonized_video=final_cartoon_video_path)
+        
+        except Exception:
+            print(traceback.print_exc())
+            flash("Our server hiccuped :/ Please upload another file! :)")
+            return render_template("index_cartoonized.html")
+    else:
+        return render_template("index_cartoonized.html")
+
+if __name__ == "__main__":
+    # Commemnt the below line to run the Appication on Google Colab using ngrok
+    if opts['colab-mode']:
+        app.run()
+    else:
+        app.run(debug=False, host='127.0.0.1', port=int(os.environ.get('PORT', 8080)))
